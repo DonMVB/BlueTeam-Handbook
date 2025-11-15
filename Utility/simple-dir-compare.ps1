@@ -1,10 +1,32 @@
 param (
-    [Parameter(Mandatory=$true)]
     [string]$PathA,
-
-    [Parameter(Mandatory=$true)]
-    [string]$PathB
+    [string]$PathB,
+    [switch]$h
 )
+
+function Show-Help {
+    Write-Host "Compare-Directories.ps1 -PathA <Directory1> -PathB <Directory2>" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Compares two directories recursively by file name and size." -ForegroundColor Gray
+    Write-Host "Reports files missing from either directory or with size mismatches." -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Usage Example:" -ForegroundColor Yellow
+    Write-Host "  .\Compare-Directories.ps1 -PathA 'C:\Source' -PathB 'D:\Backup'" -ForegroundColor White
+    Write-Host ""
+    Write-Host "Optional Flags:"
+    Write-Host "  -h or /h     Show this help message" -ForegroundColor Gray
+    exit
+}
+
+if ($h -or $args -contains "-h" -or $args -contains "/h") {
+    Show-Help
+}
+
+if (-not $PathA -or -not $PathB) {
+    Write-Host "Error: Both -PathA and -PathB are required." -ForegroundColor Red
+    Write-Host ""
+    Show-Help
+}
 
 function Get-FileSizeTable {
     param ([string]$Path)
