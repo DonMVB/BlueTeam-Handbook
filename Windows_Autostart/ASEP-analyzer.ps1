@@ -25,6 +25,12 @@ param(
     [string]$ExportFormat = "TXT"
 )
 
+# Ensure running with appropriate privileges
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Warning "Not running as Administrator. Some information may be unavailable."
+}
+
 # Initialize results collection
 $Results = @{
     "SystemInfo" = @{}
@@ -45,87 +51,134 @@ $Results = @{
     "Drivers" = @()
     "NetworkProviders" = @()
     "COM" = @()
+    "AppInit" = @()
+    "BootExecute" = @()
+    "KnownDLLs" = @()
 }
 
 # Helper function to convert binary registry data to readable text
 function Convert-RegistryData {
     param([object]$Data, [string]$ValueType)
     
-    if ($null -eq $Data) { return $null }
+    if ($null -eq $Data) { return "" }
     
     switch ($ValueType) {
         "Binary" {
             if ($Data -is [byte[]]) {
-                $text = [System.Text.Encoding]::ASCII.GetString($Data) -replace '[^\x20-\x7E]', '.'
-                return "Binary: $text (Hex: $([BitConverter]::ToString($Data) -replace '-',''))"
+                # Try to extract readable strings
+                $text = [System.Text.Encoding]::Unicode.GetString($Data) -replace '[^\x20-\x7E]', ''
+                if ([string]::IsNullOrWhiteSpace($text)) {
+                    $text = [System.Text.Encoding]::ASCII.GetString($Data) -replace '[^\x20-\x7E]', ''
+                }
+                $hex = [BitConverter]::ToString($Data) -replace '-',''
+                if ($text.Length -gt 10) {
+                    return $text.Trim()
+                } else {
+                    return "0x$hex"
+                }
             }
             return $Data.ToString()
         }
-        "DWord" { return "DWord: $Data" }
-        "QWord" { return "QWord: $Data" }
-        "MultiString" { return "MultiString: $($Data -join '; ')" }
-        "ExpandString" { return "ExpandString: $Data" }
+        "DWord" { return $Data }
+        "QWord" { return $Data }
+        "MultiString" { 
+            if ($Data -is [array]) {
+                return ($Data -join '; ')
+            }
+            return $Data 
+        }
+        "ExpandString" { 
+            try {
+                return [Environment]::ExpandEnvironmentVariables($Data)
+            } catch {
+                return $Data
+            }
+        }
         default { return $Data.ToString() }
     }
 }
 
-# Helper function to safely get registry values
+# Helper function to safely get registry values - FIXED VERSION
 function Get-SafeRegistryValue {
-    param([string]$Path, [string]$Name = $null)
+    param(
+        [string]$Path, 
+        [string]$Name = $null,
+        [switch]$AllValues
+    )
     
     try {
-        if (Test-Path -Path "Registry::$Path" -ErrorAction SilentlyContinue) {
-            $key = Get-Item -Path "Registry::$Path" -ErrorAction SilentlyContinue
-            if ($key) {
-                if ($Name) {
-                    $value = $key.GetValue($Name, $null)
-                    $valueType = $key.GetValueKind($Name)
-                    return @{
-                        Value = $value
-                        Type = $valueType.ToString()
-                        ConvertedValue = Convert-RegistryData -Data $value -ValueType $valueType.ToString()
-                    }
-                } else {
-                    $values = @()
-                    foreach ($valueName in $key.GetValueNames()) {
-                        $value = $key.GetValue($valueName, $null)
-                        $valueType = $key.GetValueKind($valueName)
-                        $values += @{
-                            Name = $valueName
-                            Value = $value
-                            Type = $valueType.ToString()
-                            ConvertedValue = Convert-RegistryData -Data $value -ValueType $valueType.ToString()
-                            Path = $Path
-                        }
-                    }
-                    return $values
+        # Remove any "Registry::" prefix if present
+        $cleanPath = $Path -replace '^Registry::', ''
+        
+        # Test if the path exists
+        if (-not (Test-Path -Path "Registry::$cleanPath" -ErrorAction SilentlyContinue)) {
+            return $null
+        }
+        
+        $key = Get-Item -Path "Registry::$cleanPath" -ErrorAction Stop
+        
+        if ($Name) {
+            # Get specific value
+            if ($key.Property -contains $Name) {
+                $value = $key.GetValue($Name, $null)
+                $valueType = $key.GetValueKind($Name)
+                return @{
+                    Value = $value
+                    Type = $valueType.ToString()
+                    ConvertedValue = Convert-RegistryData -Data $value -ValueType $valueType.ToString()
                 }
             }
+            return $null
+        } else {
+            # Get all values
+            $values = @()
+            foreach ($valueName in $key.Property) {
+                try {
+                    $value = $key.GetValue($valueName, $null)
+                    $valueType = $key.GetValueKind($valueName)
+                    $converted = Convert-RegistryData -Data $value -ValueType $valueType.ToString()
+                    
+                    $values += @{
+                        Name = $valueName
+                        Value = $value
+                        Type = $valueType.ToString()
+                        ConvertedValue = $converted
+                        Path = $cleanPath
+                    }
+                } catch {
+                    Write-Verbose "Error reading value '$valueName' from $cleanPath"
+                }
+            }
+            return $values
         }
     }
     catch {
-        Write-Warning "Error accessing registry path: $Path - $($_.Exception.Message)"
+        Write-Verbose "Error accessing registry path $Path - $($_.Exception.Message)"
+        return $null
     }
-    return $null
 }
 
-Write-Host "Starting Windows ASEP Analysis..." -ForegroundColor Green
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Windows ASEP Analysis Tool" -ForegroundColor Cyan
+Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Collect System Information
-Write-Host "Collecting system information..." -ForegroundColor Yellow
+Write-Host "[*] Collecting system information..." -ForegroundColor Yellow
+$os = Get-CimInstance Win32_OperatingSystem
 $Results.SystemInfo = @{
     ComputerName = $env:COMPUTERNAME
-    OSVersion = (Get-WmiObject Win32_OperatingSystem).Caption
-    OSBuild = (Get-WmiObject Win32_OperatingSystem).BuildNumber
-    Architecture = (Get-WmiObject Win32_OperatingSystem).OSArchitecture
+    OSVersion = $os.Caption
+    OSBuild = $os.BuildNumber
+    Architecture = $os.OSArchitecture
     CurrentUser = $env:USERNAME
     Domain = $env:USERDOMAIN
     ScanDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     PSVersion = $PSVersionTable.PSVersion.ToString()
+    IsAdmin = $isAdmin
 }
 
-# 1. RUN KEYS
-Write-Host "Analyzing Run Keys..." -ForegroundColor Yellow
+# 1. RUN KEYS - FIXED
+Write-Host "[*] Analyzing Run Keys..." -ForegroundColor Yellow
 $RunKeyPaths = @(
     "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
     "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
@@ -141,47 +194,75 @@ $RunKeyPaths = @(
 
 foreach ($path in $RunKeyPaths) {
     $values = Get-SafeRegistryValue -Path $path
-    if ($values) {
-        $Results.RunKeys += $values | ForEach-Object { 
-            $_ | Add-Member -NotePropertyName "Category" -NotePropertyValue "Run Keys"
-            $_
+    if ($values -and $values.Count -gt 0) {
+        foreach ($val in $values) {
+            $Results.RunKeys += [PSCustomObject]@{
+                Category = "Run Keys"
+                Name = $val.Name
+                Path = $val.Path
+                Value = $val.ConvertedValue
+                Type = $val.Type
+            }
         }
+        Write-Host "  [+] Found $($values.Count) entries in $path" -ForegroundColor Green
     }
 }
 
-# 2. WINLOGON ENTRIES
-Write-Host "Analyzing Winlogon entries..." -ForegroundColor Yellow
+# 2. WINLOGON ENTRIES - FIXED
+Write-Host "[*] Analyzing Winlogon entries..." -ForegroundColor Yellow
 $WinlogonKeys = @(
     @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; Value="Userinit"},
     @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; Value="Shell"},
     @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; Value="System"},
     @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; Value="TaskMan"},
-    @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows"; Value="AppInit_DLLs"}
+    @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; Value="VmApplet"},
+    @{Path="HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify"; Value=$null},
+    @{Path="HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; Value="Shell"}
 )
 
 foreach ($item in $WinlogonKeys) {
     $value = Get-SafeRegistryValue -Path $item.Path -Name $item.Value
-    if ($value -and $value.Value) {
-        $Results.Winlogon += @{
+    if ($value -and $value.ConvertedValue) {
+        $Results.Winlogon += [PSCustomObject]@{
+            Category = "Winlogon"
             Name = $item.Value
             Path = $item.Path
-            Value = $value.Value
+            Value = $value.ConvertedValue
             Type = $value.Type
-            ConvertedValue = $value.ConvertedValue
-            Category = "Winlogon"
         }
+        Write-Host "  [+] Found: $($item.Value)" -ForegroundColor Green
     }
 }
 
-# 3. SERVICES
-Write-Host "Analyzing Services..." -ForegroundColor Yellow
+# AppInit_DLLs
+$appInitPaths = @(
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+    "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows"
+)
+foreach ($path in $appInitPaths) {
+    $value = Get-SafeRegistryValue -Path $path -Name "AppInit_DLLs"
+    if ($value -and $value.ConvertedValue) {
+        $Results.AppInit += [PSCustomObject]@{
+            Category = "AppInit DLLs"
+            Name = "AppInit_DLLs"
+            Path = $path
+            Value = $value.ConvertedValue
+            Type = $value.Type
+        }
+        Write-Host "  [+] Found AppInit_DLLs" -ForegroundColor Green
+    }
+}
+
+# 3. SERVICES - FIXED
+Write-Host "[*] Analyzing Services..." -ForegroundColor Yellow
 try {
-    $services = Get-WmiObject Win32_Service | Where-Object { 
-        $_.StartMode -eq "Auto" -or $_.StartMode -eq "Automatic"
-    } | Select-Object Name, DisplayName, PathName, StartMode, StartName, State, ServiceType
+    $services = Get-CimInstance Win32_Service | Where-Object { 
+        $_.StartMode -in @("Auto", "Automatic")
+    }
     
     foreach ($service in $services) {
-        $Results.Services += @{
+        $Results.Services += [PSCustomObject]@{
+            Category = "Services"
             Name = $service.Name
             DisplayName = $service.DisplayName
             PathName = $service.PathName
@@ -189,213 +270,296 @@ try {
             StartName = $service.StartName
             State = $service.State
             ServiceType = $service.ServiceType
-            Category = "Services"
         }
     }
+    Write-Host "  [+] Found $($services.Count) auto-start services" -ForegroundColor Green
 }
 catch {
     Write-Warning "Error collecting services: $($_.Exception.Message)"
 }
 
-# 4. SCHEDULED TASKS
-Write-Host "Analyzing Scheduled Tasks..." -ForegroundColor Yellow
+# 4. SCHEDULED TASKS - FIXED
+Write-Host "[*] Analyzing Scheduled Tasks..." -ForegroundColor Yellow
 try {
-    $tasks = Get-ScheduledTask | Where-Object { 
+    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { 
         $_.State -eq "Ready" -and $_.Settings.Enabled -eq $true 
-    } | Select-Object TaskName, TaskPath, State
+    }
     
+    $taskCount = 0
     foreach ($task in $tasks) {
         try {
             $taskInfo = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue
-            $action = (Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath).Actions | Select-Object -First 1
+            $actions = (Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue).Actions
             
-            $Results.ScheduledTasks += @{
-                TaskName = $task.TaskName
-                TaskPath = $task.TaskPath
-                State = $task.State
-                LastRunTime = if($taskInfo) { $taskInfo.LastRunTime } else { "Unknown" }
-                NextRunTime = if($taskInfo) { $taskInfo.NextRunTime } else { "Unknown" }
-                Action = if($action) { "$($action.Execute) $($action.Arguments)" } else { "Unknown" }
-                Category = "Scheduled Tasks"
+            foreach ($action in $actions) {
+                $actionStr = ""
+                if ($action.Execute) {
+                    $actionStr = "$($action.Execute)"
+                    if ($action.Arguments) {
+                        $actionStr += " $($action.Arguments)"
+                    }
+                }
+                
+                $Results.ScheduledTasks += [PSCustomObject]@{
+                    Category = "Scheduled Tasks"
+                    TaskName = $task.TaskName
+                    TaskPath = $task.TaskPath
+                    State = $task.State
+                    LastRunTime = if($taskInfo) { $taskInfo.LastRunTime.ToString() } else { "Unknown" }
+                    NextRunTime = if($taskInfo) { $taskInfo.NextRunTime.ToString() } else { "Unknown" }
+                    Action = $actionStr
+                    Author = $task.Author
+                }
+                $taskCount++
             }
         }
         catch {
-            $Results.ScheduledTasks += @{
-                TaskName = $task.TaskName
-                TaskPath = $task.TaskPath
-                State = $task.State
-                Error = $_.Exception.Message
-                Category = "Scheduled Tasks"
-            }
+            Write-Verbose "Error processing task $($task.TaskName) - $($_.Exception.Message)"
         }
     }
+    Write-Host "  [+] Found $taskCount enabled tasks" -ForegroundColor Green
 }
 catch {
     Write-Warning "Error collecting scheduled tasks: $($_.Exception.Message)"
 }
 
-# 5. STARTUP FOLDERS
-Write-Host "Analyzing Startup Folders..." -ForegroundColor Yellow
+# 5. STARTUP FOLDERS - FIXED
+Write-Host "[*] Analyzing Startup Folders..." -ForegroundColor Yellow
 $StartupPaths = @(
     "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
-    "$env:ALLUSERSPROFILE\Microsoft\Windows\Start Menu\Programs\Startup"
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
 )
 
 foreach ($path in $StartupPaths) {
     if (Test-Path $path) {
         $items = Get-ChildItem $path -Force -ErrorAction SilentlyContinue
         foreach ($item in $items) {
-            $Results.StartupFolders += @{
+            # For shortcuts, try to get target
+            $target = ""
+            if ($item.Extension -eq ".lnk") {
+                try {
+                    $shell = New-Object -ComObject WScript.Shell
+                    $shortcut = $shell.CreateShortcut($item.FullName)
+                    $target = $shortcut.TargetPath
+                } catch {
+                    $target = "Unable to resolve"
+                }
+            }
+            
+            $Results.StartupFolders += [PSCustomObject]@{
+                Category = "Startup Folders"
                 Name = $item.Name
                 Path = $item.FullName
-                Type = if($item.PSIsContainer) { "Folder" } else { "File" }
-                LastWriteTime = $item.LastWriteTime
+                Target = $target
+                Type = if($item.PSIsContainer) { "Folder" } else { $item.Extension }
+                LastWriteTime = $item.LastWriteTime.ToString()
                 Size = if(-not $item.PSIsContainer) { $item.Length } else { 0 }
-                Category = "Startup Folders"
             }
+        }
+        if ($items.Count -gt 0) {
+            Write-Host "  [+] Found $($items.Count) items in $path" -ForegroundColor Green
         }
     }
 }
 
-# 6. BROWSER HELPER OBJECTS
-Write-Host "Analyzing Browser Helper Objects..." -ForegroundColor Yellow
+# 6. BROWSER HELPER OBJECTS - FIXED
+Write-Host "[*] Analyzing Browser Helper Objects..." -ForegroundColor Yellow
 $BHOPaths = @(
     "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects",
     "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects"
 )
 
+$bhoCount = 0
 foreach ($path in $BHOPaths) {
     try {
         if (Test-Path "Registry::$path") {
             $bhos = Get-ChildItem "Registry::$path" -ErrorAction SilentlyContinue
             foreach ($bho in $bhos) {
-                $name = $bho.PSChildName
-                $clsidPath = "HKLM\SOFTWARE\Classes\CLSID\$name"
-                $description = Get-SafeRegistryValue -Path $clsidPath -Name "(Default)"
-                $inProcServer = Get-SafeRegistryValue -Path "$clsidPath\InProcServer32" -Name "(Default)"
+                $clsid = $bho.PSChildName
                 
-                $Results.BrowserHelperObjects += @{
-                    CLSID = $name
-                    Description = if($description) { $description.ConvertedValue } else { "Unknown" }
-                    DLLPath = if($inProcServer) { $inProcServer.ConvertedValue } else { "Unknown" }
-                    RegistryPath = $path
-                    Category = "Browser Helper Objects"
+                # Try multiple locations for CLSID info
+                $clsidPaths = @(
+                    "HKLM\SOFTWARE\Classes\CLSID\$clsid",
+                    "HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\$clsid",
+                    "HKCU\SOFTWARE\Classes\CLSID\$clsid"
+                )
+                
+                $description = ""
+                $dllPath = ""
+                
+                foreach ($clsidPath in $clsidPaths) {
+                    if (-not $description) {
+                        $desc = Get-SafeRegistryValue -Path $clsidPath -Name "(Default)"
+                        if ($desc -and $desc.ConvertedValue) { $description = $desc.ConvertedValue }
+                    }
+                    if (-not $dllPath) {
+                        $dll = Get-SafeRegistryValue -Path "$clsidPath\InProcServer32" -Name "(Default)"
+                        if ($dll -and $dll.ConvertedValue) { $dllPath = $dll.ConvertedValue }
+                    }
                 }
+                
+                $Results.BrowserHelperObjects += [PSCustomObject]@{
+                    Category = "Browser Helper Objects"
+                    CLSID = $clsid
+                    Description = if($description) { $description } else { "Unknown" }
+                    DLLPath = if($dllPath) { $dllPath } else { "Unknown" }
+                    RegistryPath = $path
+                }
+                $bhoCount++
             }
         }
     }
     catch {
-        Write-Warning "Error analyzing BHOs at $path`: $($_.Exception.Message)"
+        Write-Verbose "Error analyzing BHOs at $path - $($_.Exception.Message)"
     }
 }
+if ($bhoCount -gt 0) {
+    Write-Host "  [+] Found $bhoCount BHOs" -ForegroundColor Green
+}
 
-# 7. SHELL EXTENSIONS (Sample of common ones)
-Write-Host "Analyzing Shell Extensions..." -ForegroundColor Yellow
+# 7. SHELL EXTENSIONS - Sample
+Write-Host "[*] Analyzing Shell Extensions..." -ForegroundColor Yellow
 $ShellExtPaths = @(
     "HKLM\SOFTWARE\Classes\*\shellex\ContextMenuHandlers",
     "HKLM\SOFTWARE\Classes\Directory\shellex\ContextMenuHandlers",
-    "HKLM\SOFTWARE\Classes\Drive\shellex\ContextMenuHandlers"
+    "HKLM\SOFTWARE\Classes\Folder\shellex\ContextMenuHandlers"
 )
 
+$shellExtCount = 0
 foreach ($path in $ShellExtPaths) {
     try {
         if (Test-Path "Registry::$path") {
             $handlers = Get-ChildItem "Registry::$path" -ErrorAction SilentlyContinue
             foreach ($handler in $handlers) {
-                $clsid = Get-SafeRegistryValue -Path $handler.PSPath.Replace("Microsoft.PowerShell.Core\Registry::", "") -Name "(Default)"
-                $Results.ShellExtensions += @{
-                    HandlerName = $handler.PSChildName
-                    CLSID = if($clsid) { $clsid.ConvertedValue } else { "Unknown" }
-                    Type = $path.Split('\')[-1]
-                    RegistryPath = $path
+                $handlerPath = $handler.Name -replace 'HKEY_LOCAL_MACHINE', 'HKLM'
+                $clsidVal = Get-SafeRegistryValue -Path $handlerPath -Name "(Default)"
+                
+                $Results.ShellExtensions += [PSCustomObject]@{
                     Category = "Shell Extensions"
+                    HandlerName = $handler.PSChildName
+                    CLSID = if($clsidVal) { $clsidVal.ConvertedValue } else { "Unknown" }
+                    Type = $path.Split('\')[-2]
+                    RegistryPath = $path
                 }
+                $shellExtCount++
             }
         }
     }
     catch {
-        Write-Warning "Error analyzing shell extensions at $path`: $($_.Exception.Message)"
+        Write-Verbose "Error analyzing shell extensions at $path"
     }
 }
+if ($shellExtCount -gt 0) {
+    Write-Host "  [+] Found $shellExtCount shell extensions" -ForegroundColor Green
+}
 
-# 8. WMI EVENT SUBSCRIPTIONS
-Write-Host "Analyzing WMI Event Subscriptions..." -ForegroundColor Yellow
+# 8. WMI EVENT SUBSCRIPTIONS - FIXED
+Write-Host "[*] Analyzing WMI Event Subscriptions..." -ForegroundColor Yellow
 try {
-    $wmiConsumers = Get-WmiObject -Namespace "root\subscription" -Class "__EventConsumer" -ErrorAction SilentlyContinue
+    $wmiConsumers = Get-CimInstance -Namespace "root\subscription" -ClassName "__EventConsumer" -ErrorAction SilentlyContinue
     foreach ($consumer in $wmiConsumers) {
-        $Results.WMISubscriptions += @{
-            Name = $consumer.Name
-            Class = $consumer.__CLASS
-            CreatorSID = $consumer.CreatorSID
-            MachineName = $consumer.MachineName
+        $Results.WMISubscriptions += [PSCustomObject]@{
             Category = "WMI Subscriptions"
+            Name = $consumer.Name
+            Class = $consumer.CimClass.CimClassName
+            CreatorSID = $consumer.CreatorSID
         }
+    }
+    if ($wmiConsumers.Count -gt 0) {
+        Write-Host "  [+] Found $($wmiConsumers.Count) WMI consumers" -ForegroundColor Green
     }
 }
 catch {
-    Write-Warning "Error collecting WMI subscriptions: $($_.Exception.Message)"
+    Write-Verbose "Error collecting WMI subscriptions: $($_.Exception.Message)"
 }
 
-# 9. ACTIVE SETUP
-Write-Host "Analyzing Active Setup..." -ForegroundColor Yellow
+# 9. ACTIVE SETUP - FIXED
+Write-Host "[*] Analyzing Active Setup..." -ForegroundColor Yellow
 $ActiveSetupPaths = @(
     "HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components",
     "HKLM\SOFTWARE\WOW6432Node\Microsoft\Active Setup\Installed Components"
 )
 
+$activeSetupCount = 0
 foreach ($path in $ActiveSetupPaths) {
     try {
         if (Test-Path "Registry::$path") {
             $components = Get-ChildItem "Registry::$path" -ErrorAction SilentlyContinue
             foreach ($component in $components) {
-                $stubPath = Get-SafeRegistryValue -Path $component.PSPath.Replace("Microsoft.PowerShell.Core\Registry::", "") -Name "StubPath"
-                if ($stubPath -and $stubPath.Value) {
-                    $Results.ActiveSetup += @{
+                $compPath = $component.Name -replace 'HKEY_LOCAL_MACHINE', 'HKLM'
+                $stubPath = Get-SafeRegistryValue -Path $compPath -Name "StubPath"
+                
+                if ($stubPath -and $stubPath.ConvertedValue) {
+                    $Results.ActiveSetup += [PSCustomObject]@{
+                        Category = "Active Setup"
                         ComponentID = $component.PSChildName
                         StubPath = $stubPath.ConvertedValue
                         RegistryPath = $path
-                        Category = "Active Setup"
                     }
+                    $activeSetupCount++
                 }
             }
         }
     }
     catch {
-        Write-Warning "Error analyzing Active Setup at $path`: $($_.Exception.Message)"
+        Write-Verbose "Error analyzing Active Setup at $path"
     }
 }
+if ($activeSetupCount -gt 0) {
+    Write-Host "  [+] Found $activeSetupCount Active Setup entries" -ForegroundColor Green
+}
 
-# 10. IMAGE FILE EXECUTION OPTIONS
-Write-Host "Analyzing Image File Execution Options..." -ForegroundColor Yellow
+# 10. IMAGE FILE EXECUTION OPTIONS - FIXED
+Write-Host "[*] Analyzing Image File Execution Options..." -ForegroundColor Yellow
 $IFEOPaths = @(
     "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
     "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
 )
 
+$ifeoCount = 0
 foreach ($path in $IFEOPaths) {
     try {
         if (Test-Path "Registry::$path") {
             $executables = Get-ChildItem "Registry::$path" -ErrorAction SilentlyContinue
             foreach ($exe in $executables) {
-                $debugger = Get-SafeRegistryValue -Path $exe.PSPath.Replace("Microsoft.PowerShell.Core\Registry::", "") -Name "Debugger"
-                if ($debugger -and $debugger.Value) {
-                    $Results.ImageFileExecution += @{
+                $exePath = $exe.Name -replace 'HKEY_LOCAL_MACHINE', 'HKLM'
+                $debugger = Get-SafeRegistryValue -Path $exePath -Name "Debugger"
+                
+                if ($debugger -and $debugger.ConvertedValue) {
+                    $Results.ImageFileExecution += [PSCustomObject]@{
+                        Category = "Image File Execution Options"
                         Executable = $exe.PSChildName
                         Debugger = $debugger.ConvertedValue
                         RegistryPath = $path
-                        Category = "Image File Execution Options"
                     }
+                    $ifeoCount++
                 }
             }
         }
     }
     catch {
-        Write-Warning "Error analyzing IFEO at $path`: $($_.Exception.Message)"
+        Write-Verbose "Error analyzing IFEO at $path"
     }
 }
+if ($ifeoCount -gt 0) {
+    Write-Host "  [+] Found $ifeoCount IFEO entries" -ForegroundColor Green
+}
 
-# 11. POWERSHELL PROFILES
-Write-Host "Analyzing PowerShell Profiles..." -ForegroundColor Yellow
+# 11. BOOT EXECUTE
+Write-Host "[*] Analyzing Boot Execute..." -ForegroundColor Yellow
+$bootExec = Get-SafeRegistryValue -Path "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "BootExecute"
+if ($bootExec -and $bootExec.ConvertedValue) {
+    $Results.BootExecute += [PSCustomObject]@{
+        Category = "Boot Execute"
+        Name = "BootExecute"
+        Value = $bootExec.ConvertedValue
+        Path = "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager"
+    }
+    Write-Host "  [+] Found BootExecute entry" -ForegroundColor Green
+}
+
+# 12. POWERSHELL PROFILES
+Write-Host "[*] Analyzing PowerShell Profiles..." -ForegroundColor Yellow
 $ProfilePaths = @(
     $PROFILE.CurrentUserCurrentHost,
     $PROFILE.CurrentUserAllHosts,
@@ -406,50 +570,49 @@ $ProfilePaths = @(
 foreach ($profilePath in $ProfilePaths) {
     if ($profilePath -and (Test-Path $profilePath -ErrorAction SilentlyContinue)) {
         try {
-            $content = Get-Content $profilePath -ErrorAction SilentlyContinue | Select-Object -First 10
-            $Results.PowerShellProfiles += @{
-                ProfilePath = $profilePath
-                Exists = $true
-                FirstLines = $content -join "`n"
-                LastModified = (Get-Item $profilePath).LastWriteTime
+            $content = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
+            $preview = if ($content.Length -gt 200) { $content.Substring(0, 200) + "..." } else { $content }
+            
+            $Results.PowerShellProfiles += [PSCustomObject]@{
                 Category = "PowerShell Profiles"
+                ProfilePath = $profilePath
+                LastModified = (Get-Item $profilePath).LastWriteTime.ToString()
+                SizeBytes = (Get-Item $profilePath).Length
+                Preview = $preview
             }
+            Write-Host "  [+] Found profile: $profilePath" -ForegroundColor Green
         }
         catch {
-            $Results.PowerShellProfiles += @{
-                ProfilePath = $profilePath
-                Exists = $true
-                Error = $_.Exception.Message
-                Category = "PowerShell Profiles"
-            }
+            Write-Verbose "Error reading profile $profilePath"
         }
     }
 }
 
-# 12. DRIVERS (Sample of suspicious locations)
-Write-Host "Analyzing Drivers..." -ForegroundColor Yellow
+# 13. DRIVERS - FIXED
+Write-Host "[*] Analyzing Drivers..." -ForegroundColor Yellow
 try {
-    $drivers = Get-WmiObject Win32_SystemDriver | Where-Object { 
-        $_.StartMode -eq "Auto" -or $_.StartMode -eq "System" -or $_.StartMode -eq "Boot"
-    } | Select-Object Name, DisplayName, PathName, StartMode, State, ServiceType
+    $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object { 
+        $_.StartMode -in @("Auto", "System", "Boot")
+    }
     
     foreach ($driver in $drivers) {
-        $Results.Drivers += @{
+        $Results.Drivers += [PSCustomObject]@{
+            Category = "Drivers"
             Name = $driver.Name
             DisplayName = $driver.DisplayName
             PathName = $driver.PathName
             StartMode = $driver.StartMode
             State = $driver.State
             ServiceType = $driver.ServiceType
-            Category = "Drivers"
         }
     }
+    Write-Host "  [+] Found $($drivers.Count) auto-start drivers" -ForegroundColor Green
 }
 catch {
     Write-Warning "Error collecting drivers: $($_.Exception.Message)"
 }
 
-Write-Host "Analysis complete. Generating report..." -ForegroundColor Green
+Write-Host "`n[*] Analysis complete. Generating report..." -ForegroundColor Green
 
 # Generate Output
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -464,7 +627,11 @@ switch ($ExportFormat) {
                 $allResults += $Results[$category]
             }
         }
-        $allResults | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+        if ($allResults.Count -gt 0) {
+            $allResults | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+        } else {
+            Write-Warning "No data to export!"
+        }
     }
     "JSON" {
         $outputFile += ".json"
@@ -473,41 +640,41 @@ switch ($ExportFormat) {
     default {
         $outputFile += ".txt"
         $report = @"
+================================================================
 WINDOWS AUTO START EXTENSIBILITY POINTS (ASEP) ANALYSIS REPORT
 ================================================================
 
 System Information:
-- Computer: $($Results.SystemInfo.ComputerName)
-- OS: $($Results.SystemInfo.OSVersion)
-- Build: $($Results.SystemInfo.OSBuild)
-- Architecture: $($Results.SystemInfo.Architecture)
-- User: $($Results.SystemInfo.CurrentUser)
-- Domain: $($Results.SystemInfo.Domain)
-- Scan Date: $($Results.SystemInfo.ScanDate)
-- PowerShell: $($Results.SystemInfo.PSVersion)
+------------------
+Computer:      $($Results.SystemInfo.ComputerName)
+OS:            $($Results.SystemInfo.OSVersion)
+Build:         $($Results.SystemInfo.OSBuild)
+Architecture:  $($Results.SystemInfo.Architecture)
+User:          $($Results.SystemInfo.CurrentUser)
+Domain:        $($Results.SystemInfo.Domain)
+Scan Date:     $($Results.SystemInfo.ScanDate)
+PowerShell:    $($Results.SystemInfo.PSVersion)
+Admin Rights:  $($Results.SystemInfo.IsAdmin)
 
 ================================================================
 
 "@
         
-        foreach ($category in $Results.Keys) {
+        foreach ($category in $Results.Keys | Sort-Object) {
             if ($category -eq "SystemInfo") { continue }
             
             $items = $Results[$category]
             if ($items.Count -gt 0) {
-                $report += "`n$($category.ToUpper()) ($($items.Count) items):`n"
-                $report += "=" * ($category.Length + 20) + "`n"
+                $report += "`n$($category.ToUpper()) - $($items.Count) item(s)`n"
+                $report += "=" * 70 + "`n"
                 
                 foreach ($item in $items) {
-                    $report += "`nName: $($item.Name)"
-                    if ($item.Path) { $report += "`nPath: $($item.Path)" }
-                    if ($item.ConvertedValue) { $report += "`nValue: $($item.ConvertedValue)" }
-                    elseif ($item.Value) { $report += "`nValue: $($item.Value)" }
-                    if ($item.Type) { $report += "`nType: $($item.Type)" }
-                    if ($item.LastWriteTime) { $report += "`nLast Modified: $($item.LastWriteTime)" }
-                    if ($item.State) { $report += "`nState: $($item.State)" }
-                    if ($item.StartMode) { $report += "`nStart Mode: $($item.StartMode)" }
-                    $report += "`n" + "-" * 50 + "`n"
+                    foreach ($prop in $item.PSObject.Properties) {
+                        if ($prop.Value -and $prop.Name -ne "Category") {
+                            $report += "$($prop.Name): $($prop.Value)`n"
+                        }
+                    }
+                    $report += "-" * 70 + "`n"
                 }
             }
         }
@@ -516,16 +683,25 @@ System Information:
     }
 }
 
-Write-Host "Report saved to: $outputFile" -ForegroundColor Cyan
-Write-Host "Analysis Summary:" -ForegroundColor Green
-foreach ($category in $Results.Keys) {
+Write-Host "`n[+] Report saved to: $outputFile" -ForegroundColor Cyan
+
+# Display summary
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "ANALYSIS SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$totalItems = 0
+foreach ($category in $Results.Keys | Sort-Object) {
     if ($category -ne "SystemInfo") {
         $count = $Results[$category].Count
         if ($count -gt 0) {
-            Write-Host "  $category`: $count items" -ForegroundColor White
+            Write-Host ("{0,-30} : {1,5}" -f $category, $count) -ForegroundColor White
+            $totalItems += $count
         }
     }
 }
+Write-Host ("=" * 40) -ForegroundColor Cyan
+Write-Host ("{0,-30} : {1,5}" -f "TOTAL ITEMS", $totalItems) -ForegroundColor Green
+Write-Host "`n"
 
-# Return results for further processing if needed
 return $Results
