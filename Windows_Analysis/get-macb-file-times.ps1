@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Print NTFS MACB times (Modified, Accessed, Changed, Birth) for a file or directory in a two-column (label/value) format.
+  Print NTFS MACB times (Modified, Accessed, Changed, Birth) for a file or directory in a two-column (label/value) format,
+  and show a compact human-readable difference from Birth plus a right-aligned seconds field on the following line.
 
 .SYNTAX
   .\Get-File-Macb-Times.ps1 -Path "C:\path\to\file_or_dir"
@@ -144,14 +145,84 @@ finally {
     }
 }
 
-# Output in two-column (label/value) format (not a table)
-$fmt = "{0,-10} {1}"
-Write-Output ($fmt -f 'Modified',  ($modifiedTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")))
-Write-Output ($fmt -f 'Accessed',  ($accessedTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")))
+# -------------------------
+# Offset formatting helpers
+# -------------------------
+function Format-ShortTimeSpan {
+    param([TimeSpan]$ts)
+    $days = [int]$ts.TotalDays
+    $hours = [int]$ts.Hours
+    $minutes = [int]$ts.Minutes
+    $seconds = [int]$ts.Seconds
+    return ("{0} d, {1} h, {2} m, {3} s" -f $days, $hours, $minutes, $seconds)
+}
+
+function Get-OffsetInfo {
+    param(
+        [DateTime]$timeUtc,
+        [DateTime]$birthUtc
+    )
+
+    if ($null -eq $timeUtc) {
+        return @{
+            Human = "<unavailable - permission or API error>";
+            SecondsField = ("<unavailable>").PadLeft(20);
+        }
+    }
+
+    $diff = $timeUtc - $birthUtc
+    $isBefore = $diff.TotalSeconds -lt 0
+
+    if ($isBefore) {
+        $absDiff = [TimeSpan]::FromSeconds([math]::Round([math]::Abs($diff.TotalSeconds)))
+        $human = (Format-ShortTimeSpan -ts $absDiff) + " (BEFORE Birth)"
+        $secondsStr = ("-{0}" -f ([math]::Round([math]::Abs($diff.TotalSeconds))))
+    }
+    else {
+        $human = Format-ShortTimeSpan -ts $diff
+        $secondsStr = ("{0}" -f ([math]::Round($diff.TotalSeconds)))
+    }
+
+    $secondsField = $secondsStr.PadLeft(20)
+
+    return @{
+        Human = $human;
+        SecondsField = $secondsField;
+    }
+}
+
+# Compute offsets
+$modifiedInfo = Get-OffsetInfo -timeUtc $modifiedTimeUtc -birthUtc $birthTimeUtc
+$accessedInfo = Get-OffsetInfo -timeUtc $accessedTimeUtc -birthUtc $birthTimeUtc
 if ($changeTimeUtc -ne $null) {
-    Write-Output ($fmt -f 'Changed',   ($changeTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")))
+    $changedInfo = Get-OffsetInfo -timeUtc $changeTimeUtc -birthUtc $birthTimeUtc
 }
 else {
-    Write-Output ($fmt -f 'Changed',   "<unavailable - permission or API error; run with -Verbose to see details>")
+    $changedInfo = @{
+        Human = "<unavailable - permission or API error>";
+        SecondsField = ("<unavailable>").PadLeft(20);
+    }
 }
-Write-Output ($fmt -f 'Birth',     ($birthTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")))
+
+# -------------------------
+# Output: first line contains label, UTC time, "Diff " + compact human text
+# second line contains the right-aligned seconds field (20 chars) preceded by two spaces
+# -------------------------
+$fmtLine = "{0,-10} {1}  Diff {2}"
+Write-Output ($fmtLine -f 'Modified', ($modifiedTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")), $modifiedInfo.Human)
+Write-Output ("Modified:  " + $modifiedInfo.SecondsField)
+Write-Output ($fmtLine -f 'Accessed', ($accessedTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")), $accessedInfo.Human)
+Write-Output ("Accessed:  " + $accessedInfo.SecondsField)
+if ($changeTimeUtc -ne $null) {
+    Write-Output ($fmtLine -f 'Changed', ($changeTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")), $changedInfo.Human)
+    Write-Output ("Changed:  " + $changedInfo.SecondsField)
+}
+else {
+    Write-Output ($fmtLine -f 'Changed', "<unavailable - permission or API error>", $changedInfo.Human)
+    Write-Output ("changed:  " + $changedInfo.SecondsField)
+}
+# Birth line: Diff is zero; seconds field is 0 right-aligned
+$birthHuman = "0 d, 0 h, 0 m, 0 s"
+$birthSecondsField = ("0").PadLeft(20)
+Write-Output ($fmtLine -f 'Birth', ($birthTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fffffff 'UTC'")), $birthHuman)
+Write-Output ("Birth:  " + $birthSecondsField)
